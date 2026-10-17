@@ -1,0 +1,377 @@
+#!/usr/bin/env bash
+# SSessions - gestionnaire tmux en Bash
+# Version 1.0.0
+
+set -u
+
+APP="SSessions"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ssessions"
+PROFILE_DIR="$CONFIG_DIR/profiles"
+CONFIG="$CONFIG_DIR/config"
+
+mkdir -p "$PROFILE_DIR"
+
+# Configuration par défaut
+if [[ ! -f "$CONFIG" ]]; then
+    cat > "$CONFIG" <<'EOF'
+REMOTE_USER="user"
+REMOTE_HOST="server_ip"
+REMOTE_DIRECTORY="/home/serveur/downloads"
+LOCAL_DIRECTORY="$HOME/Downloads"
+EOF
+fi
+
+# shellcheck disable=SC1090
+source "$CONFIG"
+
+# ---------- Utilitaires ----------
+
+pause() {
+    echo
+    read -r -p "Appuie sur Entrée pour continuer..." _
+}
+
+header() {
+    clear 2>/dev/null || true
+    echo "================================"
+    echo "          $APP v1.0"
+    echo "================================"
+    echo
+}
+
+require_command() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        echo "Erreur : '$1' n'est pas installé."
+        return 1
+    fi
+}
+
+valid_name() {
+    [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]]
+}
+
+# ---------- Sessions tmux ----------
+
+list_sessions() {
+    require_command tmux || return
+    echo "Sessions disponibles :"
+    tmux list-sessions 2>/dev/null || echo "Aucune session active."
+}
+
+create_session() {
+    require_command tmux || return
+
+    local name directory command_line
+    read -r -p "Nom de la session : " name
+
+    if ! valid_name "$name"; then
+        echo "Nom invalide. Utilise lettres, chiffres, _ ou -."
+        return
+    fi
+
+    if tmux has-session -t "=$name" 2>/dev/null; then
+        echo "Une session nommée '$name' existe déjà."
+        return
+    fi
+
+    read -r -p "Répertoire de départ [$HOME] : " directory
+    directory="${directory:-$HOME}"
+
+    if [[ ! -d "$directory" ]]; then
+        echo "Le répertoire n'existe pas."
+        return
+    fi
+
+    read -r -p "Commande à lancer (vide = shell interactif) : " command_line
+
+    tmux new-session -d -s "$name" -c "$directory" || {
+        echo "Impossible de créer la session."
+        return
+    }
+
+    if [[ -n "$command_line" ]]; then
+        tmux send-keys -t "=$name" -- "$command_line" C-m
+    fi
+
+    echo "Session '$name' créée."
+    read -r -p "Rejoindre maintenant ? [o/N] " answer
+    if [[ "$answer" =~ ^[oOyY]$ ]]; then
+        tmux attach-session -t "=$name"
+    fi
+}
+
+attach_session() {
+    require_command tmux || return
+    local name
+    read -r -p "Nom de la session : " name
+
+    if tmux has-session -t "=$name" 2>/dev/null; then
+        tmux attach-session -t "=$name"
+    else
+        echo "Session introuvable."
+    fi
+}
+
+kill_session() {
+    require_command tmux || return
+    local name answer
+    read -r -p "Session à terminer : " name
+
+    if ! tmux has-session -t "=$name" 2>/dev/null; then
+        echo "Session introuvable."
+        return
+    fi
+
+    read -r -p "Confirmer la fermeture de '$name' ? [o/N] " answer
+    if [[ "$answer" =~ ^[oOyY]$ ]]; then
+        tmux kill-session -t "=$name"
+        echo "Session terminée."
+    fi
+}
+
+# ---------- Profils ----------
+
+create_profile() {
+    local name directory command_line description file
+
+    read -r -p "Nom du profil : " name
+    if ! valid_name "$name"; then
+        echo "Nom invalide."
+        return
+    fi
+
+    file="$PROFILE_DIR/$name.conf"
+    if [[ -e "$file" ]]; then
+        echo "Ce profil existe déjà."
+        return
+    fi
+
+    read -r -p "Description : " description
+    read -r -p "Répertoire de départ : " directory
+    read -r -p "Commande à lancer : " command_line
+
+    if [[ ! -d "$directory" ]]; then
+        echo "Attention : ce répertoire n'existe pas actuellement."
+    fi
+
+    # Écriture de valeurs en échappant les caractères spéciaux du shell.
+    {
+        printf 'DESCRIPTION=%q\n' "$description"
+        printf 'DIRECTORY=%q\n' "$directory"
+        printf 'COMMAND=%q\n' "$command_line"
+    } > "$file"
+
+    chmod 600 "$file"
+    echo "Profil créé : $name"
+}
+
+list_profiles() {
+    local file
+    shopt -s nullglob
+    local files=("$PROFILE_DIR"/*.conf)
+    shopt -u nullglob
+
+    if ((${#files[@]} == 0)); then
+        echo "Aucun profil enregistré."
+        return
+    fi
+
+    for file in "${files[@]}"; do
+        echo "- $(basename "$file" .conf)"
+    done
+}
+
+start_profile() {
+    require_command tmux || return
+
+    local name file description directory command_line
+    read -r -p "Nom du profil à lancer : " name
+
+    if ! valid_name "$name"; then
+        echo "Nom invalide."
+        return
+    fi
+
+    file="$PROFILE_DIR/$name.conf"
+    if [[ ! -f "$file" ]]; then
+        echo "Profil introuvable."
+        return
+    fi
+
+    # Les fichiers de profil sont des fichiers de configuration shell.
+    # Ne lance que des profils que tu as créés et auxquels tu fais confiance.
+    # shellcheck disable=SC1090
+    source "$file"
+
+    directory="${DIRECTORY:-$HOME}"
+    command_line="${COMMAND:-}"
+    description="${DESCRIPTION:-$name}"
+
+    if [[ ! -d "$directory" ]]; then
+        echo "Répertoire inexistant : $directory"
+        return
+    fi
+
+    if tmux has-session -t "=$name" 2>/dev/null; then
+        echo "La session '$name' existe déjà."
+        return
+    fi
+
+    tmux new-session -d -s "$name" -c "$directory" || return
+
+    if [[ -n "$command_line" ]]; then
+        tmux send-keys -t "=$name" -- "$command_line" C-m
+    fi
+
+    echo "$description : session '$name' démarrée."
+    read -r -p "Rejoindre maintenant ? [o/N] " answer
+    if [[ "$answer" =~ ^[oOyY]$ ]]; then
+        tmux attach-session -t "=$name"
+    fi
+}
+
+# ---------- Transferts SCP ----------
+
+upload_file() {
+    require_command scp || return
+
+    local file
+    read -r -p "Chemin du fichier local : " file
+
+    if [[ ! -f "$file" ]]; then
+        echo "Fichier introuvable."
+        return
+    fi
+
+    scp -- "$file" \
+        "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIRECTORY}/"
+}
+
+download_file() {
+    require_command scp || return
+
+    local name
+    read -r -p "Nom du fichier distant : " name
+
+    if [[ -z "$name" || "$name" == */* || "$name" == *".."* ]]; then
+        echo "Indique uniquement un nom de fichier simple."
+        return
+    fi
+
+    mkdir -p "$LOCAL_DIRECTORY"
+
+    scp -- "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIRECTORY}/${name}" \
+        "$LOCAL_DIRECTORY/"
+}
+
+# ---------- Configuration ----------
+
+edit_config() {
+    local editor="${EDITOR:-nano}"
+    "$editor" "$CONFIG"
+    echo "Configuration modifiée."
+}
+
+# ---------- Menu ----------
+
+menu() {
+    while true; do
+        header
+        cat <<'MENU'
+1. Créer une session
+2. Lister les sessions
+3. Rejoindre une session
+4. Terminer une session
+5. Créer un profil
+6. Lister les profils
+7. Démarrer un profil
+8. Envoyer un fichier (SCP)
+9. Télécharger un fichier (SCP)
+10. Modifier la configuration
+0. Quitter
+MENU
+        echo
+        read -r -p "Choix : " choice
+
+        case "$choice" in
+            1) create_session; pause ;;
+            2) list_sessions; pause ;;
+            3) attach_session ;;
+            4) kill_session; pause ;;
+            5) create_profile; pause ;;
+            6) list_profiles; pause ;;
+            7) start_profile; pause ;;
+            8) upload_file; pause ;;
+            9) download_file; pause ;;
+            10) edit_config ;;
+            0) break ;;
+            *) echo "Choix invalide."; pause ;;
+        esac
+    done
+}
+
+# ---------- Commandes directes ----------
+
+case "${1:-}" in
+    "")
+        menu
+        ;;
+    list)
+        list_sessions
+        ;;
+    create)
+        create_session
+        ;;
+    attach)
+        if [[ -n "${2:-}" ]] && tmux has-session -t "=$2" 2>/dev/null; then
+            tmux attach-session -t "=$2"
+        else
+            attach_session
+        fi
+        ;;
+    kill)
+        kill_session
+        ;;
+    profiles)
+        list_profiles
+        ;;
+    start)
+        if [[ -n "${2:-}" ]]; then
+            # Pour garder le même parcours interactif :
+            # demander le profil si aucun argument n'est fourni.
+            PROFILE_CHOICE="$2"
+            if valid_name "$PROFILE_CHOICE"; then
+                set -- start-profile "$PROFILE_CHOICE"
+            else
+                echo "Nom de profil invalide."
+                exit 2
+            fi
+        fi
+        if [[ "${1:-}" == "start-profile" ]]; then
+            PROFILE_CHOICE="${2:-}"
+            if [[ -n "$PROFILE_CHOICE" ]]; then
+                # Le profil est lancé via le menu pour cette version.
+                start_profile
+            fi
+        else
+            start_profile
+        fi
+        ;;
+    config)
+        edit_config
+        ;;
+    upload)
+        upload_file
+        ;;
+    download)
+        download_file
+        ;;
+    help|-h|--help)
+        echo "Usage : ssessions [list|create|attach|kill|profiles|start|config|upload|download]"
+        ;;
+    *)
+        echo "Commande inconnue : $1"
+        echo "Utilise 'ssessions --help'."
+        exit 2
+        ;;
+esac
