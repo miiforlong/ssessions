@@ -1,13 +1,25 @@
 #!/usr/bin/env bash
 # SSessions - gestionnaire tmux en Bash
-# Version 1.0.0
+# Version 1.1.0
 
 set -u
 
 APP="SSessions"
+VERSION="1.1"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ssessions"
 PROFILE_DIR="$CONFIG_DIR/profiles"
 CONFIG="$CONFIG_DIR/config"
+
+# Fichier système listant les profils à démarrer au boot du serveur.
+# Format : un profil par ligne
+#   nom_profil        -> démarré pour l'utilisateur qui exécute l'autostart
+#   utilisateur:nom   -> démarré uniquement pour cet utilisateur
+# Les lignes vides et celles commençant par # sont ignorées.
+AUTOSTART_CONF="${SSESSIONS_AUTOSTART_CONF:-/etc/ssessions/ssessions.conf}"
+SERVICE_NAME="ssessions-autostart@"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
 
 mkdir -p "$PROFILE_DIR"
 
@@ -34,7 +46,7 @@ pause() {
 header() {
     clear 2>/dev/null || true
     echo "================================"
-    echo "          $APP v1.0"
+    echo "          $APP v$VERSION"
     echo "================================"
     echo
 }
@@ -50,6 +62,28 @@ valid_name() {
     [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]]
 }
 
+confirm() {
+    local answer
+    read -r -p "$1 [o/N] " answer
+    [[ "$answer" =~ ^[oOyY]$ ]]
+}
+
+# Exécute une commande avec les droits root (directement ou via sudo).
+run_privileged() {
+    if ((EUID == 0)); then
+        "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo "$@"
+    else
+        echo "Erreur : droits root requis (sudo introuvable)." >&2
+        return 1
+    fi
+}
+
+current_user() {
+    id -un
+}
+
 # ---------- Sessions tmux ----------
 
 list_sessions() {
@@ -61,7 +95,7 @@ list_sessions() {
 create_session() {
     require_command tmux || return
 
-    local name directory command_line
+    local name directory command_line answer
     read -r -p "Nom de la session : " name
 
     if ! valid_name "$name"; then
@@ -102,8 +136,8 @@ create_session() {
 
 attach_session() {
     require_command tmux || return
-    local name
-    read -r -p "Nom de la session : " name
+    local name="${1:-}"
+    [[ -n "$name" ]] || read -r -p "Nom de la session : " name
 
     if tmux has-session -t "=$name" 2>/dev/null; then
         tmux attach-session -t "=$name"
@@ -114,19 +148,207 @@ attach_session() {
 
 kill_session() {
     require_command tmux || return
-    local name answer
-    read -r -p "Session à terminer : " name
+    local name="${1:-}"
+    [[ -n "$name" ]] || read -r -p "Session à terminer : " name
 
     if ! tmux has-session -t "=$name" 2>/dev/null; then
         echo "Session introuvable."
         return
     fi
 
-    read -r -p "Confirmer la fermeture de '$name' ? [o/N] " answer
-    if [[ "$answer" =~ ^[oOyY]$ ]]; then
+    if confirm "Confirmer la fermeture de '$name' ?"; then
         tmux kill-session -t "=$name"
         echo "Session terminée."
     fi
+}
+
+# ---------- Autostart (/etc/ssessions/ssessions.conf) ----------
+
+autostart_entry() {
+    # Entrée liée à l'utilisateur courant
+    echo "$(current_user):$1"
+}
+
+autostart_ensure_file() {
+    if [[ ! -f "$AUTOSTART_CONF" ]]; then
+        run_privileged mkdir -p "$(dirname "$AUTOSTART_CONF")" || return 1
+        {
+            echo "# SSessions - profils démarrés au boot du serveur"
+            echo "# Format : nom_profil  ou  utilisateur:nom_profil"
+        } | run_privileged tee "$AUTOSTART_CONF" >/dev/null || return 1
+        run_privileged chmod 644 "$AUTOSTART_CONF"
+    fi
+}
+
+autostart_has() {
+    [[ -f "$AUTOSTART_CONF" ]] && grep -qxF -- "$1" "$AUTOSTART_CONF"
+}
+
+autostart_add() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || read -r -p "Profil à démarrer au boot : " name
+
+    if ! valid_name "$name"; then
+        echo "Nom invalide."
+        return 1
+    fi
+
+    if [[ ! -f "$PROFILE_DIR/$name.conf" ]]; then
+        echo "Profil introuvable."
+        return 1
+    fi
+
+    local entry
+    entry="$(autostart_entry "$name")"
+
+    if autostart_has "$entry"; then
+        echo "'$name' est déjà dans l'autostart."
+        return 0
+    fi
+
+    autostart_ensure_file || return 1
+    printf '%s\n' "$entry" | run_privileged tee -a "$AUTOSTART_CONF" >/dev/null || return 1
+    echo "'$name' sera démarré au boot ($AUTOSTART_CONF)."
+}
+
+autostart_remove() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || read -r -p "Profil à retirer de l'autostart : " name
+
+    if ! valid_name "$name"; then
+        echo "Nom invalide."
+        return 1
+    fi
+
+    local entry tmp
+    entry="$(autostart_entry "$name")"
+
+    if ! autostart_has "$entry"; then
+        echo "'$name' n'est pas dans l'autostart."
+        return 0
+    fi
+
+    tmp="$(mktemp)" || return 1
+    grep -vxF -- "$entry" "$AUTOSTART_CONF" > "$tmp" || true
+    run_privileged install -m 644 "$tmp" "$AUTOSTART_CONF"
+    local rc=$?
+    rm -f "$tmp"
+    ((rc == 0)) && echo "'$name' retiré de l'autostart."
+    return "$rc"
+}
+
+autostart_list() {
+    if [[ ! -f "$AUTOSTART_CONF" ]]; then
+        echo "Aucun fichier $AUTOSTART_CONF (rien en autostart)."
+        return
+    fi
+
+    echo "Autostart ($AUTOSTART_CONF) :"
+    local line found=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"
+        line="${line//[[:space:]]/}"
+        [[ -z "$line" ]] && continue
+        echo "- $line"
+        found=1
+    done < "$AUTOSTART_CONF"
+    ((found)) || echo "(vide)"
+}
+
+# Appelé au démarrage du serveur : lit ssessions.conf et lance les profils.
+autostart_run() {
+    require_command tmux || return 1
+
+    if [[ ! -f "$AUTOSTART_CONF" ]]; then
+        echo "Aucun fichier $AUTOSTART_CONF, rien à démarrer."
+        return 0
+    fi
+
+    local me line owner name
+    me="$(current_user)"
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"
+        line="${line//[[:space:]]/}"
+        [[ -z "$line" ]] && continue
+
+        if [[ "$line" == *:* ]]; then
+            owner="${line%%:*}"
+            name="${line#*:}"
+            [[ "$owner" == "$me" ]] || continue
+        else
+            name="$line"
+        fi
+
+        if ! valid_name "$name"; then
+            echo "Entrée ignorée (nom invalide) : $line" >&2
+            continue
+        fi
+
+        start_profile_core "$name" || echo "Échec du démarrage de '$name'." >&2
+    done < "$AUTOSTART_CONF"
+}
+
+# Installe un service systemd qui lance "ssessions autostart-run" au boot.
+autostart_install_service() {
+    require_command systemctl || return 1
+
+    local user
+    user="$(current_user)"
+
+    echo "Installation de $SERVICE_FILE (utilisateur : $user)..."
+
+    run_privileged tee "$SERVICE_FILE" >/dev/null <<EOF
+[Unit]
+Description=SSessions autostart pour %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=%i
+Environment=TERM=xterm-256color
+ExecStart=$SELF autostart-run
+# Les serveurs tmux doivent survivre à la fin du script de démarrage.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    [[ $? -eq 0 ]] || return 1
+
+    run_privileged systemctl daemon-reload || return 1
+    run_privileged systemctl enable "${SERVICE_NAME}${user}.service" || return 1
+    echo "Service activé : ${SERVICE_NAME}${user}.service"
+    echo "Test immédiat : sudo systemctl start ${SERVICE_NAME}${user}.service"
+}
+
+autostart_menu() {
+    local choice
+    while true; do
+        header
+        cat <<'MENU'
+Autostart (démarrage au boot)
+1. Lister les profils en autostart
+2. Ajouter un profil à l'autostart
+3. Retirer un profil de l'autostart
+4. Installer le service systemd
+5. Lancer l'autostart maintenant
+0. Retour
+MENU
+        echo
+        read -r -p "Choix : " choice
+        case "$choice" in
+            1) autostart_list; pause ;;
+            2) autostart_add; pause ;;
+            3) autostart_remove; pause ;;
+            4) autostart_install_service; pause ;;
+            5) autostart_run; pause ;;
+            0) break ;;
+            *) echo "Choix invalide."; pause ;;
+        esac
+    done
 }
 
 # ---------- Profils ----------
@@ -163,10 +385,14 @@ create_profile() {
 
     chmod 600 "$file"
     echo "Profil créé : $name"
+
+    if confirm "Démarrer ce profil automatiquement au boot du serveur ?"; then
+        autostart_add "$name"
+    fi
 }
 
 list_profiles() {
-    local file
+    local file name mark
     shopt -s nullglob
     local files=("$PROFILE_DIR"/*.conf)
     shopt -u nullglob
@@ -177,15 +403,108 @@ list_profiles() {
     fi
 
     for file in "${files[@]}"; do
-        echo "- $(basename "$file" .conf)"
+        name="$(basename "$file" .conf)"
+        mark=""
+        if autostart_has "$(autostart_entry "$name")" || autostart_has "$name"; then
+            mark=" [autostart]"
+        fi
+        if command -v tmux >/dev/null 2>&1 && tmux has-session -t "=$name" 2>/dev/null; then
+            mark="$mark [actif]"
+        fi
+        echo "- $name$mark"
     done
+}
+
+# Démarre un profil sans aucune interaction (utilisé aussi par l'autostart).
+start_profile_core() {
+    local name="$1" file directory command_line description
+
+    file="$PROFILE_DIR/$name.conf"
+    if [[ ! -f "$file" ]]; then
+        echo "Profil introuvable : $name" >&2
+        return 1
+    fi
+
+    # Les fichiers de profil sont des fichiers de configuration shell.
+    # Ne lance que des profils que tu as créés et auxquels tu fais confiance.
+    unset DESCRIPTION DIRECTORY COMMAND
+    # shellcheck disable=SC1090
+    source "$file"
+
+    directory="${DIRECTORY:-$HOME}"
+    command_line="${COMMAND:-}"
+    description="${DESCRIPTION:-$name}"
+
+    if [[ ! -d "$directory" ]]; then
+        echo "Répertoire inexistant : $directory" >&2
+        return 1
+    fi
+
+    if tmux has-session -t "=$name" 2>/dev/null; then
+        echo "La session '$name' existe déjà."
+        return 0
+    fi
+
+    tmux new-session -d -s "$name" -c "$directory" || return 1
+
+    if [[ -n "$command_line" ]]; then
+        tmux send-keys -t "=$name" -- "$command_line" C-m
+    fi
+
+    echo "$description : session '$name' démarrée."
 }
 
 start_profile() {
     require_command tmux || return
 
-    local name file description directory command_line
-    read -r -p "Nom du profil à lancer : " name
+    local name="${1:-}" answer
+    [[ -n "$name" ]] || read -r -p "Nom du profil à lancer : " name
+
+    if ! valid_name "$name"; then
+        echo "Nom invalide."
+        return
+    fi
+
+    start_profile_core "$name" || return
+
+    if tmux has-session -t "=$name" 2>/dev/null; then
+        read -r -p "Rejoindre maintenant ? [o/N] " answer
+        if [[ "$answer" =~ ^[oOyY]$ ]]; then
+            tmux attach-session -t "=$name"
+        fi
+    fi
+}
+
+stop_profile() {
+    require_command tmux || return
+
+    local name="${1:-}"
+    [[ -n "$name" ]] || read -r -p "Nom du profil à arrêter : " name
+
+    if ! valid_name "$name"; then
+        echo "Nom invalide."
+        return
+    fi
+
+    if [[ ! -f "$PROFILE_DIR/$name.conf" ]]; then
+        echo "Profil introuvable."
+        return
+    fi
+
+    if ! tmux has-session -t "=$name" 2>/dev/null; then
+        echo "Le profil '$name' n'est pas en cours d'exécution."
+        return
+    fi
+
+    if confirm "Arrêter la session du profil '$name' ?"; then
+        tmux kill-session -t "=$name"
+        echo "Profil '$name' arrêté."
+    fi
+}
+
+delete_profile() {
+    local name="${1:-}" file
+    [[ -n "$name" ]] || read -r -p "Nom du profil à supprimer : " name
 
     if ! valid_name "$name"; then
         echo "Nom invalide."
@@ -198,36 +517,29 @@ start_profile() {
         return
     fi
 
-    # Les fichiers de profil sont des fichiers de configuration shell.
-    # Ne lance que des profils que tu as créés et auxquels tu fais confiance.
-    # shellcheck disable=SC1090
-    source "$file"
-
-    directory="${DIRECTORY:-$HOME}"
-    command_line="${COMMAND:-}"
-    description="${DESCRIPTION:-$name}"
-
-    if [[ ! -d "$directory" ]]; then
-        echo "Répertoire inexistant : $directory"
+    if ! confirm "Supprimer définitivement le profil '$name' ?"; then
         return
     fi
 
-    if tmux has-session -t "=$name" 2>/dev/null; then
-        echo "La session '$name' existe déjà."
-        return
+    # Arrêt de la session si elle tourne
+    if command -v tmux >/dev/null 2>&1 && tmux has-session -t "=$name" 2>/dev/null; then
+        if confirm "La session '$name' est active. L'arrêter aussi ?"; then
+            tmux kill-session -t "=$name"
+            echo "Session arrêtée."
+        fi
     fi
 
-    tmux new-session -d -s "$name" -c "$directory" || return
-
-    if [[ -n "$command_line" ]]; then
-        tmux send-keys -t "=$name" -- "$command_line" C-m
+    # Retrait de l'autostart
+    if autostart_has "$(autostart_entry "$name")"; then
+        autostart_remove "$name"
+    fi
+    if autostart_has "$name"; then
+        echo "Note : l'entrée globale '$name' reste dans $AUTOSTART_CONF"
+        echo "       (supprime-la manuellement si nécessaire)."
     fi
 
-    echo "$description : session '$name' démarrée."
-    read -r -p "Rejoindre maintenant ? [o/N] " answer
-    if [[ "$answer" =~ ^[oOyY]$ ]]; then
-        tmux attach-session -t "=$name"
-    fi
+    rm -f -- "$file"
+    echo "Profil '$name' supprimé."
 }
 
 # ---------- Transferts SCP ----------
@@ -275,6 +587,7 @@ edit_config() {
 # ---------- Menu ----------
 
 menu() {
+    local choice
     while true; do
         header
         cat <<'MENU'
@@ -285,9 +598,12 @@ menu() {
 5. Créer un profil
 6. Lister les profils
 7. Démarrer un profil
-8. Envoyer un fichier (SCP)
-9. Télécharger un fichier (SCP)
-10. Modifier la configuration
+8. Arrêter un profil
+9. Supprimer un profil
+10. Autostart au boot
+11. Envoyer un fichier (SCP)
+12. Télécharger un fichier (SCP)
+13. Modifier la configuration
 0. Quitter
 MENU
         echo
@@ -301,9 +617,12 @@ MENU
             5) create_profile; pause ;;
             6) list_profiles; pause ;;
             7) start_profile; pause ;;
-            8) upload_file; pause ;;
-            9) download_file; pause ;;
-            10) edit_config ;;
+            8) stop_profile; pause ;;
+            9) delete_profile; pause ;;
+            10) autostart_menu ;;
+            11) upload_file; pause ;;
+            12) download_file; pause ;;
+            13) edit_config ;;
             0) break ;;
             *) echo "Choix invalide."; pause ;;
         esac
@@ -311,6 +630,30 @@ MENU
 }
 
 # ---------- Commandes directes ----------
+
+usage() {
+    cat <<'EOF'
+Usage : ssessions [commande]
+
+  (aucune)                 menu interactif
+  list                     lister les sessions
+  create                   créer une session
+  attach [session]         rejoindre une session
+  kill [session]           terminer une session
+  profiles                 lister les profils
+  start [profil]           démarrer un profil
+  stop [profil]            arrêter un profil
+  delete [profil]          supprimer un profil
+  autostart list           lister les profils lancés au boot
+  autostart add [profil]   ajouter un profil à l'autostart
+  autostart remove [profil] retirer un profil de l'autostart
+  autostart install        installer le service systemd
+  autostart-run            lancer les profils de l'autostart (utilisé au boot)
+  config                   modifier la configuration
+  upload                   envoyer un fichier (SCP)
+  download                 télécharger un fichier (SCP)
+EOF
+}
 
 case "${1:-}" in
     "")
@@ -323,39 +666,35 @@ case "${1:-}" in
         create_session
         ;;
     attach)
-        if [[ -n "${2:-}" ]] && tmux has-session -t "=$2" 2>/dev/null; then
-            tmux attach-session -t "=$2"
-        else
-            attach_session
-        fi
+        attach_session "${2:-}"
         ;;
     kill)
-        kill_session
+        kill_session "${2:-}"
         ;;
     profiles)
         list_profiles
         ;;
     start)
-        if [[ -n "${2:-}" ]]; then
-            # Pour garder le même parcours interactif :
-            # demander le profil si aucun argument n'est fourni.
-            PROFILE_CHOICE="$2"
-            if valid_name "$PROFILE_CHOICE"; then
-                set -- start-profile "$PROFILE_CHOICE"
-            else
-                echo "Nom de profil invalide."
-                exit 2
-            fi
-        fi
-        if [[ "${1:-}" == "start-profile" ]]; then
-            PROFILE_CHOICE="${2:-}"
-            if [[ -n "$PROFILE_CHOICE" ]]; then
-                # Le profil est lancé via le menu pour cette version.
-                start_profile
-            fi
-        else
-            start_profile
-        fi
+        start_profile "${2:-}"
+        ;;
+    stop)
+        stop_profile "${2:-}"
+        ;;
+    delete)
+        delete_profile "${2:-}"
+        ;;
+    autostart)
+        case "${2:-}" in
+            list|"") autostart_list ;;
+            add) autostart_add "${3:-}" ;;
+            remove) autostart_remove "${3:-}" ;;
+            install) autostart_install_service ;;
+            run) autostart_run ;;
+            *) echo "Usage : ssessions autostart [list|add|remove|install|run]"; exit 2 ;;
+        esac
+        ;;
+    autostart-run)
+        autostart_run
         ;;
     config)
         edit_config
@@ -367,7 +706,7 @@ case "${1:-}" in
         download_file
         ;;
     help|-h|--help)
-        echo "Usage : ssessions [list|create|attach|kill|profiles|start|config|upload|download]"
+        usage
         ;;
     *)
         echo "Commande inconnue : $1"
