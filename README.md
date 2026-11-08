@@ -48,3 +48,14 @@ ssessions help     # Show help
 ```
 
 **Note:** TMUX sessions run on the machine where `ssessions` is executed. For remote session management, connect to your server over SSH first.
+
+## Common issues 
+
+the most common issue is that local/bin is not in the PATH.
+
+To fix it : 
+
+```shell
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+```
